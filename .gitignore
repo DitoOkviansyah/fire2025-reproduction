@@ -1,0 +1,16 @@
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+.env
+.env.*
+
+outputs/
+runs/
+datasets/
+weights/
+
+*.pt
+*.pth
+*.pem
+id_rsa
+id_ed25519
