@@ -84,6 +84,9 @@ def build_experiments(table7_dfire_overrides=None):
 
 def environment_info(device=0):
     """Periksa environment tanpa instalasi, tanpa CUDA allocation dan tanpa unduhan."""
+    device = int(device)
+    if device < 0:
+        raise ValueError("Device harus berupa indeks GPU nonnegatif.")
     info = {"python": sys.version, "platform": platform.platform(),
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"), "packages": {}}
     for pkg in ("torch", "ultralytics", "PyYAML", "numpy", "matplotlib"):
@@ -96,10 +99,11 @@ def environment_info(device=0):
         info["torch_cuda_runtime"] = torch.version.cuda
         info["cuda_available"] = torch.cuda.is_available()
         if info["cuda_available"]:
-            if int(device) >= torch.cuda.device_count():
-                raise ValueError(f"Device {device} tidak tersedia; jumlah GPU terlihat: {torch.cuda.device_count()}")
-            free, total = torch.cuda.mem_get_info(int(device))
-            info["gpu"] = {"index_visible": int(device), "name": torch.cuda.get_device_name(int(device)),
+            count = torch.cuda.device_count()
+            if device >= count:
+                raise ValueError(f"Device {device} tidak tersedia; jumlah GPU terlihat: {count}")
+            free, total = torch.cuda.mem_get_info(device)
+            info["gpu"] = {"index_visible": device, "name": torch.cuda.get_device_name(device),
                            "free_gib": round(free / 2**30, 2), "total_gib": round(total / 2**30, 2)}
     else:
         info["cuda_available"] = False
@@ -116,8 +120,6 @@ def load_ultralytics_without_install():
 
 
 def require_training_environment(device=0):
-    if int(device) != 0:
-        raise ValueError("Gunakan GPU pertama yang diberikan scheduler: DEVICE=0 dan CUDA_VISIBLE_DEVICES dari HPC.")
     info = environment_info(device)
     missing = [name for name in ("torch", "ultralytics", "PyYAML") if not info["packages"][name]]
     if missing:
@@ -409,7 +411,7 @@ def evaluate_checkpoint(model, job, dataset, output_root, device, batch):
         if eval_dir.exists():
             raise FileExistsError(f"Evaluasi parsial sudah ada: {eval_dir}. Pindahkan folder tersebut sebelum mengulang.")
         metrics = model.val(data=dataset["yaml"], split=split, imgsz=job["train_args"]["imgsz"],
-                            batch=batch, device="", project=str(eval_dir.parent), name=split,
+                            batch=batch, device=device, project=str(eval_dir.parent), name=split,
                             exist_ok=False, plots=True, verbose=False)
         values = metrics.results_dict
         precision = _metric_float(values.get("metrics/precision(B)"))
@@ -466,11 +468,16 @@ def run_queue(jobs, provenance, weights_dir, output_root, device=0, workers=4, s
         completed_path = output_root / "metadata" / f"{job['id']}.complete.json"
         current_config = {"job": job, "dataset": provenance["datasets"][job["dataset"]],
                           "weights": weights[job["model"]], "seed": seed, "device": device,
-                          "workers": workers, "eval_batch": eval_batch, "ultralytics_device_arg": "",
+                          "workers": workers, "eval_batch": eval_batch, "ultralytics_device_arg": device,
                           "assumptions": [f"Seed={seed} dan deterministic=True adalah pilihan reproduksi, bukan informasi dari paper.",
                                           "Bobot awal lokal diasumsikan pretrained; jenis dan versi bobot paper tidak dipastikan.",
                                           "patience=0 memastikan jadwal epoch dijalankan penuh.",
                                           "Best checkpoint dievaluasi pada validation dan test secara terpisah."]}
+        if meta_path.is_file():
+            recorded_config = json.loads(meta_path.read_text(encoding="utf-8"))
+            if recorded_config.get("ultralytics_device_arg") == "":
+                # Preserve legacy metadata; the actual device is recorded per session below.
+                current_config["ultralytics_device_arg"] = ""
         config_text = json.dumps(current_config, indent=2, ensure_ascii=False) + "\n"
         _write_once(meta_path, config_text)
         if completed_path.is_file():
@@ -481,7 +488,8 @@ def run_queue(jobs, provenance, weights_dir, output_root, device=0, workers=4, s
         environment_log.parent.mkdir(parents=True, exist_ok=True)
         with environment_log.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-                                     "environment": info}, ensure_ascii=False, default=str) + "\n")
+                                     "environment": info, "ultralytics_device_arg": device},
+                                    ensure_ascii=False, default=str) + "\n")
         print(f"[{number}/{len(jobs)}] {job['id']} | {job['dataset']} | {job['epochs']} epoch", flush=True)
         last, best = run_dir / "weights" / "last.pt", run_dir / "weights" / "best.pt"
         started = time.time()
@@ -506,12 +514,12 @@ def run_queue(jobs, provenance, weights_dir, output_root, device=0, workers=4, s
                 if not finished:
                     print(f"Melanjutkan dari {last}", flush=True)
                     model = YOLO(str(last))
-                    model.train(resume=True, device="", workers=workers)
+                    model.train(resume=True, device=device, workers=workers)
             else:
                 model = YOLO(weights[job["model"]]["path"])
                 args = dict(job["train_args"])
                 model.train(data=provenance["datasets"][job["dataset"]]["yaml"], epochs=job["epochs"],
-                            seed=seed, deterministic=True, patience=0, device="", workers=workers,
+                            seed=seed, deterministic=True, patience=0, device=device, workers=workers,
                             project=str(output_root / "training"), name=job["id"], exist_ok=False,
                             plots=True, save=True, **args)
             if not best.is_file():

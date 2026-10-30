@@ -20,13 +20,15 @@ def main():
     parser.add_argument("--mode", choices=("audit", "train"), default="audit",
                         help="audit: hanya periksa label dan tulis manifest, tanpa GPU atau bobot")
     parser.add_argument("--run-ids", nargs="+", help="ID eksperimen; default semua 13")
-    parser.add_argument("--device", type=int, choices=[0], default=0,
-                        help="GPU pertama yang terlihat dalam CUDA_VISIBLE_DEVICES")
+    parser.add_argument("--device", type=int, default=0,
+                        help="Indeks GPU nonnegatif yang terlihat dalam CUDA_VISIBLE_DEVICES")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42,
                         help="Seed split D-Fire dan training; pilihan reproduksi, bukan seed terverifikasi dari paper")
     parser.add_argument("--eval-batch", type=int, default=16)
     args = parser.parse_args()
+    if args.device < 0:
+        parser.error("--device harus berupa indeks GPU nonnegatif")
     if args.mode == "train" and args.weights_dir is None:
         parser.error("--weights-dir wajib untuk --mode train")
     if set(args.smoke_classes) != {"smoke", "fire"}:

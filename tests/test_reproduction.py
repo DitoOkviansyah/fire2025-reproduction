@@ -1,6 +1,6 @@
 import csv, importlib, json, os, sys, tempfile, unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, patch
 from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -33,7 +33,69 @@ class ReproductionTests(unittest.TestCase):
             self.assertIn(j['id'],r.PAPER_SCORES)
             if j['id'].startswith('t7_smoke'):self.assertEqual((j['train_args']['imgsz'],j['train_args']['batch']),(416,64))
             if j['id'].startswith('t4_'):self.assertEqual((j['train_args']['optimizer'],j['train_args']['batch']),('Adam',16))
+        for j in jobs[7:]:
+            self.assertEqual(j['train_args'],{'optimizer':'SGD','batch':64,'lr0':0.01,
+                             'warmup_epochs':3.0,'warmup_bias_lr':0.1,'momentum':0.8,
+                             'weight_decay':0.0005,'amp':True,
+                             'imgsz':416 if j['id'].startswith('t7_smoke') else 640})
+            self.assertEqual(j['epochs'],300 if j['id'].startswith('t7_smoke') else 100)
         self.assertEqual(r.build_experiments({'batch':32})[-1]['train_args']['batch'],32)
+    def test_training_environment_accepts_visible_gpu_indices(self):
+        cuda=Mock()
+        cuda.is_available.return_value=True
+        cuda.device_count.return_value=2
+        cuda.mem_get_info.return_value=(4*2**30,12*2**30)
+        cuda.get_device_name.return_value='RTX 3060'
+        torch=SimpleNamespace(version=SimpleNamespace(cuda='test'),cuda=cuda)
+        with patch.object(r.importlib.metadata,'version',return_value='test'), \
+             patch.object(r.importlib,'import_module',return_value=torch):
+            for device in (0,1):
+                with self.subTest(device=device):
+                    info=r.require_training_environment(device)
+                    self.assertEqual(info['gpu']['index_visible'],device)
+                    cuda.mem_get_info.assert_called_with(device)
+                    cuda.get_device_name.assert_called_with(device)
+            self.assertEqual(cuda.device_count.call_count,2)
+
+    def test_invalid_gpu_fails_before_weights_or_training(self):
+        cuda=Mock()
+        cuda.is_available.return_value=True
+        cuda.device_count.return_value=2
+        torch=SimpleNamespace(version=SimpleNamespace(cuda='test'),cuda=cuda)
+        with patch.object(r.importlib.metadata,'version',return_value='test'), \
+             patch.object(r.importlib,'import_module',return_value=torch), \
+             patch.object(r,'validate_weight_files') as weights, \
+             patch.object(r,'load_ultralytics_without_install') as load:
+            for device in (-1,2,3):
+                with self.subTest(device=device),self.assertRaisesRegex(
+                        ValueError,'nonnegatif' if device<0 else 'jumlah GPU terlihat: 2'):
+                    r.run_queue([],{},self.root/'weights',self.out,device=device)
+            cuda.mem_get_info.assert_not_called()
+            weights.assert_not_called();load.assert_not_called()
+        self.assertFalse(self.out.exists())
+
+    def test_train_cli_forwards_device_one_and_rejects_negative(self):
+        argv=['run_hpc.py','--smoke-root',str(self.smoke),'--dfire-root',str(self.dfire),
+              '--output-root',str(self.out),'--smoke-classes','fire','smoke',
+              '--mode','train','--weights-dir',str(self.root/'weights'),
+              '--run-ids','t6_yolov10n_100','--device']
+        provenance={'datasets':{},'audit_original_splits':{}}
+        with patch.object(sys,'argv',argv+['1']), \
+             patch.dict(sys.modules,{'tqdm':SimpleNamespace(tqdm=MagicMock())}), \
+             patch.object(r,'require_training_environment') as environment, \
+             patch.object(r,'validate_weight_files'), \
+             patch.object(r,'prepare_datasets',return_value=provenance), \
+             patch.object(r,'run_queue') as queue, \
+             patch.object(r,'summarize_results',return_value=(self.out/'comparison.csv',[])), \
+             patch('builtins.print'):
+            run_hpc.main()
+            environment.assert_called_once_with(1)
+            self.assertEqual(queue.call_args.kwargs['device'],1)
+            self.assertEqual([j['id'] for j in queue.call_args.args[0]],['t6_yolov10n_100'])
+        with patch.object(sys,'argv',argv+['-1']),patch('sys.stderr'), \
+             self.assertRaises(SystemExit) as error:
+            run_hpc.main()
+        self.assertEqual(error.exception.code,2)
     def test_prepare_and_reuse_deterministic_manifests(self):
         before={p:p.read_bytes() for root in (self.smoke,self.dfire) for p in root.rglob('*') if p.is_file()}
         a=self.prepare();b=self.prepare();self.assertEqual(a,b)
@@ -187,22 +249,41 @@ class ReproductionTests(unittest.TestCase):
         modules={'ultralytics':SimpleNamespace(YOLO=FakeModel),'ultralytics.utils':SimpleNamespace(AUTOINSTALL=True),'ultralytics.utils.checks':SimpleNamespace(AUTOINSTALL=True)}
         info={'python':'3','platform':'test','packages':{'torch':'test','ultralytics':'test'},'gpu':{'name':'A100'},'cuda_visible_devices':'3'}
         with patch.object(r,'require_training_environment',return_value=info),patch.object(r.importlib,'import_module',side_effect=lambda x:modules[x]):
-            ans=r.run_queue([job],prov,weights,self.out,device=0,workers=1)
+            ans=r.run_queue([job],prov,weights,self.out,device=1,workers=1)
             self.assertEqual(ans[0]['status'],'complete');self.assertEqual(len(calls),3)
-            self.assertEqual(calls[0][1]['device'],'');self.assertEqual(calls[1][1]['device'],'')
+            self.assertEqual([kw['device'] for _,kw in calls],[1,1,1])
+            self.assertEqual([kw['split'] for kind,kw in calls if kind=='val'],['val','test'])
+            for key,value in job['train_args'].items():
+                self.assertEqual(calls[0][1][key],value)
+            self.assertEqual(calls[0][1]['epochs'],job['epochs'])
+            meta_path=self.out/'metadata'/f"{job['id']}.json"
+            metadata=json.loads(meta_path.read_text())
+            self.assertEqual(metadata['device'],1)
+            self.assertEqual(metadata['ultralytics_device_arg'],1)
             self.assertFalse(modules['ultralytics.utils.checks'].AUTOINSTALL)
             self.assertEqual(ans[0]['metrics']['test']['per_class']['fire']['ap50'],.7)
-            r.run_queue([job],prov,weights,self.out,device=0,workers=1);self.assertEqual(len(calls),3)
+            r.run_queue([job],prov,weights,self.out,device=1,workers=1);self.assertEqual(len(calls),3)
             csvpath,rows=r.summarize_results([job],self.out);self.assertTrue(csvpath.is_file());self.assertEqual(rows[0]['test_map50'],.75)
             # Simulate a failed run with a last.pt and an incomplete CSV, then resume it.
+            metadata['ultralytics_device_arg']=''
+            legacy_text=json.dumps(metadata,indent=2,ensure_ascii=False)+'\n'
+            meta_path.write_text(legacy_text,encoding='utf-8')
             (self.out/'metadata'/f"{job['id']}.complete.json").unlink()
             for split in ('val','test'):
                 (self.out/'evaluation'/job['id']/split/'metrics.json').unlink()
                 (self.out/'evaluation'/job['id']/split).rmdir()
             (self.out/'training'/job['id']/'results.csv').write_text('epoch,metric\n1,0.5\n')
-            r.run_queue([job],prov,weights,self.out,device=0,workers=1)
+            r.run_queue([job],prov,weights,self.out,device=1,workers=1)
             self.assertTrue(calls[3][1]['resume'])
-            self.assertEqual(calls[3][1]['device'],'')
+            self.assertEqual(calls[3][1],{'resume':True,'device':1,'workers':1})
+            self.assertEqual([kw['device'] for _,kw in calls],[1]*6)
+            self.assertEqual(meta_path.read_text(encoding='utf-8'),legacy_text)
+            sessions=(self.out/'metadata'/f"{job['id']}.environment.jsonl").read_text().splitlines()
+            self.assertEqual([json.loads(s)['ultralytics_device_arg'] for s in sessions],[1,1])
+            with self.assertRaises(FileExistsError):
+                r.run_queue([job],prov,weights,self.out,device=0,workers=1)
+            self.assertEqual(len(calls),6)
+            self.assertEqual(meta_path.read_text(encoding='utf-8'),legacy_text)
     def test_notebook_code_executes_without_data_or_training(self):
         nb=json.loads((ROOT/'Fire2025_Reproduction.ipynb').read_text())
         self.assertEqual(nb['nbformat'],4)
